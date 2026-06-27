@@ -1,0 +1,8 @@
+# SAP Learning Course Downloader — runtime dependencies
+# (Crawl4AI and Playwright are already installed per the project setup.)
+crawl4ai>=0.9.0
+playwright>=1.60.0
+beautifulsoup4>=4.12
+markdownify>=0.13
+rich>=13.7
+tqdm>=4.66

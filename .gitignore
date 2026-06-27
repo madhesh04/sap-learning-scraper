@@ -1,0 +1,22 @@
+# --- Secrets / session (NEVER commit) ---
+auth_state.json
+
+# --- Generated / scraped output (copyrighted course content, large) ---
+output/
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+env/
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+
+# --- Editor / OS ---
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
