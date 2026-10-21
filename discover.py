@@ -20,8 +20,12 @@ Selectors live in ``config.Selectors`` — tune there, never in this code.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+import asyncio
+import json
+import re
+from typing import Awaitable, Callable, TYPE_CHECKING, TypeVar
 
+from playwright.async_api import Error as PlaywrightError
 from playwright.async_api import TimeoutError as PlaywrightTimeout
 
 from config import Settings
@@ -36,6 +40,63 @@ log = get_logger(__name__)
 
 _MAX_EXPAND_PASSES = 12
 _MAX_SCROLL_STEPS = 25
+
+_T = TypeVar("_T")
+
+
+def _is_navigation_error(exc: Exception) -> bool:
+    """True if the error is a transient failure caused by an in-flight navigation.
+
+    Covers both 'context destroyed' and the null-document errors that occur when
+    JS runs mid-navigation/re-render (``document.body`` briefly null).
+    """
+    msg = str(exc).lower()
+    return (
+        "execution context was destroyed" in msg
+        or "navigation" in msg
+        or "cannot read properties of null" in msg
+        or "cannot read property" in msg
+    )
+
+
+async def _retry_nav(
+    action: Callable[[], Awaitable[_T]],
+    *,
+    attempts: int = 4,
+    delay_ms: int = 1_000,
+    default: _T | None = None,
+) -> _T | None:
+    """Run a Playwright call, retrying if a navigation destroys the context.
+
+    SAP Learning SPA pages sometimes client-side navigate right after load,
+    which invalidates the JS execution context mid-call. Retrying after a short
+    wait lets the new context settle.
+    """
+    last: Exception | None = None
+    for _ in range(attempts):
+        try:
+            return await action()
+        except PlaywrightError as exc:
+            if not _is_navigation_error(exc):
+                raise
+            last = exc
+            await asyncio.sleep(delay_ms / 1000)
+    log.warning("Giving up after navigation retries: %s", last)
+    return default
+
+
+async def _wait_dom_stable(page: "Page", settings: Settings) -> None:
+    """Wait for the document to finish loading and settle after any redirect."""
+    async def ready() -> None:
+        # wait_for_load_state, not wait_for_function: the latter evals a string
+        # and is blocked by the CSP on SAP's login pages.
+        await page.wait_for_load_state("load", timeout=settings.nav_timeout_ms)
+
+    try:
+        await _retry_nav(ready)
+    except PlaywrightTimeout:
+        log.info("readyState never reached 'complete'; continuing.")
+    await page.wait_for_timeout(settings.post_load_settle_ms)
 
 
 def is_lesson_url(href: str, settings: Settings) -> bool:
@@ -89,7 +150,9 @@ async def _expand_all(page: "Page", settings: Settings) -> None:
     """Click every collapsed expander until the tree is fully open."""
     selector = settings.selectors.module_expander
     for pass_no in range(_MAX_EXPAND_PASSES):
-        buttons = await page.query_selector_all(selector)
+        buttons = await _retry_nav(
+            lambda: page.query_selector_all(selector), default=[]
+        )
         if not buttons:
             break
         clicked = 0
@@ -109,13 +172,20 @@ async def _autoscroll(page: "Page") -> None:
     """Scroll down in steps so lazy-loaded lessons render."""
     last_height = 0
     for _ in range(_MAX_SCROLL_STEPS):
-        height = await page.evaluate("document.body.scrollHeight")
-        if height == last_height:
+        height = await _retry_nav(
+            lambda: page.evaluate("document.body ? document.body.scrollHeight : 0"),
+            default=0,
+        )
+        if not height or height == last_height:
             break
         last_height = height
-        await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+        await _retry_nav(
+            lambda: page.evaluate(
+                "document.body && window.scrollTo(0, document.body.scrollHeight)"
+            )
+        )
         await page.wait_for_timeout(300)
-    await page.evaluate("window.scrollTo(0, 0)")
+    await _retry_nav(lambda: page.evaluate("window.scrollTo(0, 0)"))
 
 
 async def _course_title(page: "Page", settings: Settings) -> str:
@@ -132,8 +202,9 @@ async def _course_title(page: "Page", settings: Settings) -> str:
 
 async def _extract_grouped(page: "Page", settings: Settings) -> list[Module]:
     """Best-effort: read modules and their lessons via configured selectors."""
-    raw = await page.evaluate(
-        """
+    raw = await _retry_nav(
+        lambda: page.evaluate(
+            """
         (headSel) => {
             const out = [];
             document.querySelectorAll(headSel).forEach(h => {
@@ -148,7 +219,9 @@ async def _extract_grouped(page: "Page", settings: Settings) -> list[Module]:
             return out;
         }
         """,
-        settings.selectors.module_header,
+            settings.selectors.module_header,
+        ),
+        default=[],
     )
 
     modules: list[Module] = []
@@ -167,15 +240,106 @@ async def _extract_grouped(page: "Page", settings: Settings) -> list[Module]:
     return modules
 
 
+def _next_data(html: str) -> dict | None:
+    """Return the parsed Next.js ``__NEXT_DATA__`` payload, if present."""
+    match = re.search(
+        r'<script id="__NEXT_DATA__"[^>]*>(.*?)</script>', html, re.S
+    )
+    if not match:
+        return None
+    try:
+        return json.loads(match.group(1))
+    except json.JSONDecodeError:
+        return None
+
+
+def _walk(node: object):
+    """Yield every dict nested anywhere inside ``node``."""
+    if isinstance(node, dict):
+        yield node
+        for value in node.values():
+            yield from _walk(value)
+    elif isinstance(node, list):
+        for value in node:
+            yield from _walk(value)
+
+
+def _extract_next_data(html: str, settings: Settings) -> list[Module]:
+    """Primary path: read the unit/lesson tree from the Next.js page data.
+
+    SAP Learning course pages embed the whole tree: ``standaloneCourse.courses``
+    holds units whose ``children`` reference lessons by ``objId``; the lesson
+    objects (with ``slug`` and ``title``) live elsewhere in the same payload.
+    """
+    data = _next_data(html)
+    if not data:
+        return []
+    props = data.get("props", {}).get("pageProps", {})
+    courses = (props.get("standaloneCourse") or {}).get("courses") or []
+    if not courses:
+        return []
+
+    lessons_by_id: dict[str, dict] = {}
+    for obj in _walk(props):
+        if obj.get("objType") == "lesson" and obj.get("slug") and obj.get("title"):
+            lessons_by_id.setdefault(obj.get("objId", ""), obj)
+
+    prefix = f"{settings.base_url}/courses/{settings.course_slug}"
+    modules: list[Module] = []
+    for unit in courses[0].get("children") or []:
+        if unit.get("objType") != "unit":
+            continue
+        lessons: list[Lesson] = []
+        for ref in unit.get("children") or []:
+            if ref.get("objType") != "lesson":
+                continue
+            obj = lessons_by_id.get(ref.get("objId", ""))
+            if obj:
+                lessons.append(
+                    Lesson(len(lessons) + 1, obj["title"].strip(), f"{prefix}/{obj['slug']}")
+                )
+        if lessons:
+            modules.append(
+                Module(index=len(modules) + 1, title=unit.get("title") or "Unit", lessons=lessons)
+            )
+    return modules
+
+
+async def discover_journey_courses(settings: Settings) -> tuple[str, list[str]]:
+    """Return ``(title, course_urls)`` for a learning-journey URL, in page order."""
+    async with browser_context(settings, use_auth=True) as ctx:
+        page = await ctx.new_page()
+        log.info("Opening learning journey: %s", settings.course_url)
+        await _goto_settled(page, settings.course_url, settings)
+        title = await _course_title(page, settings)
+        hrefs = await _retry_nav(
+            lambda: page.evaluate(
+                "() => [...document.querySelectorAll('a[href]')].map(a => a.href)"
+            ),
+            default=[],
+        )
+
+    urls: list[str] = []
+    for href in hrefs or []:
+        href = href.split("#", 1)[0].split("?", 1)[0].rstrip("/")
+        if href.startswith(f"{settings.base_url}/courses/") and href not in urls:
+            urls.append(href)
+    log.info("Journey '%s': %d course(s)", title, len(urls))
+    return title, urls
+
+
 async def _extract_flat(page: "Page", settings: Settings) -> list[Lesson]:
     """Fallback: collect every course-internal lesson link, ungrouped."""
-    raw = await page.evaluate(
-        """
+    raw = await _retry_nav(
+        lambda: page.evaluate(
+            """
         () => [...document.querySelectorAll('a[href]')].map(a => ({
             title: (a.innerText || '').trim(),
             url: a.href,
         }))
         """
+        ),
+        default=[],
     )
     return _dedupe(
         [
@@ -200,12 +364,20 @@ async def discover_course(settings: Settings) -> Course:
         page = await ctx.new_page()
         log.info("Opening course: %s", settings.course_url)
         await _goto_settled(page, settings.course_url, settings)
+        await _wait_dom_stable(page, settings)  # tolerate post-load SPA redirects
 
-        await _expand_all(page, settings)
-        await _autoscroll(page)
-
+        # Read the embedded page data before clicking anything: expanders can
+        # include the log-on button, which redirects to accounts.sap.com.
         title = await _course_title(page, settings)
-        modules = await _extract_grouped(page, settings)
+        html = await page.content()
+        modules = _extract_next_data(html, settings)
+        if not modules:
+            log.warning("No Next.js course data; using selector-based discovery.")
+            await _expand_all(page, settings)
+            await _wait_dom_stable(page, settings)  # expanding may trigger a re-render
+            await _autoscroll(page)
+            html = await page.content()
+            modules = await _extract_grouped(page, settings)
 
         if not modules:
             log.warning("Grouped discovery found nothing; using flat fallback.")
@@ -216,7 +388,7 @@ async def discover_course(settings: Settings) -> Course:
         # Always dump rendered HTML for selector tuning.
         debug_path = settings.course_output_dir() / "_debug_course.html"
         debug_path.parent.mkdir(parents=True, exist_ok=True)
-        debug_path.write_text(await page.content(), encoding="utf-8")
+        debug_path.write_text(html, encoding="utf-8")
         log.info("Saved rendered HTML for tuning -> %s", debug_path)
 
     course = Course(course=title, url=settings.course_url, modules=modules)

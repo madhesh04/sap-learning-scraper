@@ -19,7 +19,7 @@ import asyncio
 from dataclasses import replace
 
 from config import DEFAULT_SETTINGS, Settings
-from discover import discover_course
+from discover import discover_course, discover_journey_courses
 from exporter import (
     build_complete_course,
     load_progress,
@@ -112,6 +112,36 @@ async def run_pipeline(
     return 0
 
 
+async def run_journey(settings: Settings, args: argparse.Namespace) -> int:
+    """Run the pipeline for every course in a learning journey.
+
+    Each course is written to ``output/<journey-slug>/<course-slug>/``.
+    """
+    title, course_urls = await discover_journey_courses(settings)
+    if not course_urls:
+        log.error("No courses found on learning journey page.")
+        return 1
+
+    journey_settings = replace(
+        settings, output_dirname=f"{settings.output_dirname}/{settings.course_slug}"
+    )
+    failures = 0
+    for n, url in enumerate(course_urls, 1):
+        log.info("=== Course %d/%d of '%s': %s", n, len(course_urls), title, url)
+        try:
+            code = await run_pipeline(
+                journey_settings.with_course_url(url),
+                fresh=args.fresh,
+                discover_only=args.discover_only,
+                limit=args.limit,
+            )
+        except (RuntimeError, ValueError) as exc:
+            log.error("%s", exc)
+            code = 1
+        failures += code != 0
+    return 1 if failures else 0
+
+
 def main(argv: list[str] | None = None) -> int:
     """Entry point. Returns a process exit code."""
     args = parse_args(argv)
@@ -126,6 +156,8 @@ def main(argv: list[str] | None = None) -> int:
         return 2
 
     try:
+        if "/learning-journeys/" in settings.course_url:
+            return asyncio.run(run_journey(settings, args))
         return asyncio.run(
             run_pipeline(
                 settings,
